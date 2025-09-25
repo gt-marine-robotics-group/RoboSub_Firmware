@@ -157,6 +157,8 @@ void write_all_motors_from_cmds() {
 }
 
 void setup_depth_sensor() {
+  Wire.setSDA(DEPTH_SENSOR_SDA_PIN);
+  Wire.setSCL(DEPTH_SENSOR_SCL_PIN);
   depth_sensor_healthy = depth_sensor.init();
 
   if (depth_sensor_healthy) {
@@ -184,13 +186,13 @@ void cb_thrust(const void * msgin) {
   digitalWrite(STATUS_LED_PIN, LOW);
 }
 
-static void cb_estop(const void * msgin) {
+void cb_estop(const void * msgin) {
   const std_msgs__msg__Bool * msg = (const std_msgs__msg__Bool *)msgin;
   if (!msg) return;
   e_stop = msg->data;
 }
 
-static void cb_timer_fast(rcl_timer_t * /*timer*/, int64_t /*last_call_time*/) {
+void cb_timer_fast(rcl_timer_t * /*timer*/, int64_t /*last_call_time*/) {
   // ---- AUTO ENABLE (debounced) ----
   const bool auto_switch_active_now = (digitalRead(AUTONOMY_SWITCH_PIN) == LOW); // active-low switch
 
@@ -241,8 +243,9 @@ static void cb_timer_fast(rcl_timer_t * /*timer*/, int64_t /*last_call_time*/) {
   RCSOFTCHECK(rcl_publish(&pub_depth, &msg_depth, nullptr));
 }
 
-static void cb_timer_debug(rcl_timer_t * /*timer*/, int64_t /*last_call_time*/) {
-  // Publish the 8 thrust values being driven 
+void cb_timer_debug(rcl_timer_t * timer, int64_t last_call_time) {
+  (void)timer; (void)last_call_time;  // Avoid compiler complaining
+
   for (size_t i = 0; i < NUM_THRUSTERS; ++i) {
     msg_thrust_out.data.data[i] = static_cast<float>(thrust_cmd_percent[i]);
   }
@@ -259,7 +262,6 @@ void setup() {
   Serial.begin(SERIAL_BAUDRATE);
   set_microros_serial_transports(Serial);
 
-  Serial.begin(SERIAL_BAUDRATE);
 
   // Genric I/O
   pinMode(STATUS_LED_PIN, OUTPUT);
@@ -282,32 +284,32 @@ void setup() {
 
 
   // --- Subscribers ---
-  RCCHECK(rclc_subscription_init_best_effort(
+  RCCHECK(rclc_subscription_init_default(
     &sub_thrust,
     &node,
     ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
     "/thrust_cmds"));
 
-  RCCHECK(rclc_subscription_init_best_effort(
+  RCCHECK(rclc_subscription_init_default(
     &sub_estop,
     &node,
     ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool),
     "/estop"));
 
   // --- Publishers ---
-  RCCHECK(rclc_publisher_init_best_effort(
+  RCCHECK(rclc_publisher_init_default(
     &pub_depth,
     &node,
     ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
     "/depth_sensor"));
 
-  RCCHECK(rclc_publisher_init_best_effort(
+  RCCHECK(rclc_publisher_init_default(
     &pub_autonomy_switch,
     &node,
     ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool),
     "/auto_enable"));
 
-  RCCHECK(rclc_publisher_init_best_effort(
+  RCCHECK(rclc_publisher_init_default(
     &pub_thrustout,
     &node,
     ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
@@ -346,6 +348,18 @@ void setup() {
 void loop() {
   // Run executor work
   RCCHECK(rclc_executor_spin_some(&executor, EXECUTOR_SPIN_BUDGET_ns));
+
+  if (depth_sensor_healthy) {
+    depth_sensor.read();
+  } else {
+    if (depth_sensor.init()) {
+      depth_sensor_healthy = true;
+      depth_sensor.setModel(DEPTH_SENSOR_MODEL);
+      depth_sensor.setFluidDensity(FLUID_DENSITY_FRESHWATER_kg_per_m3);
+      depth_sensor.read();
+
+    }
+  }
 
   // Drive ESCs from current thrust commands, honoring e-stop
   if (e_stop) {

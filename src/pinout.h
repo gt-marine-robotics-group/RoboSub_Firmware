@@ -33,6 +33,6 @@ constexpr uint8_t DEPTH_SENSOR_SCL_PIN = 24; // SCL2
 constexpr uint8_t MS5837_I2C_ADDR = 0x76;
 
 // ------ Generic I/O -------
-static constexpr uint8_t STATUS_LED_PIN  = 13; // Onboard LED 
+constexpr uint8_t STATUS_LED_PIN  = 13; // Onboard LED 
 
 #endif 

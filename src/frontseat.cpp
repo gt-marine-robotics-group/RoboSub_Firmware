@@ -48,6 +48,18 @@ constexpr uint32_t DEPTH_REINIT_BACKOFF_TICKS = 10; // Backoff between re-init a
 
 #define DEPTH_SENSOR_MODEL MS5837::MS5837_30BA
 
+constexpr int ROS_DOMAIN_ID = 12;
+
+
+// ------ Agent reconnection ------
+constexpr uint32_t AGENT_PING_PERIOD_MS_WAITING     = 1500;  // try every 1.5 s while waiting
+constexpr uint32_t AGENT_PING_TIMEOUT_MS_WAITING    = 500;   // per-attempt timeout while waiting
+constexpr int      AGENT_PING_ATTEMPTS_WAITING      = 2;
+
+constexpr uint32_t AGENT_PING_PERIOD_MS_CONNECTED   = 7500;  // health check while connected
+constexpr uint32_t AGENT_PING_TIMEOUT_MS_CONNECTED  = 1500;
+constexpr int      AGENT_PING_ATTEMPTS_CONNECTED    = 5;
+
 
 // ------ Macros / Helpers ------
 #define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if ((temp_rc != RCL_RET_OK)) { error_loop(); } }
@@ -62,6 +74,13 @@ inline int throttle_percent_to_pwm_us(int throttle_percent) {
   const int clamped_percent = clamp_int(throttle_percent, THROTTLE_MIN_PERCENT, THROTTLE_MAX_PERCENT);
   const int pwm_us = ESC_PWM_NEUTRAL_us + (ESC_PWM_SCALE_us_per_percent * clamped_percent);
   return pwm_us;
+}
+
+inline bool every_n_ms(uint32_t period_ms) {
+  static uint32_t last_ms = 0;
+  const uint32_t now = millis();
+  if ((now - last_ms) >= period_ms) { last_ms = now; return true; }
+  return false;
 }
 
 // ------ Hardware Objects ------
@@ -112,6 +131,15 @@ rcl_timer_t timer_debug;  // thrust_out
 
 
 // ------- State -------
+
+enum class State : uint8_t {
+  WAITING_AGENT,
+  AGENT_AVAILABLE,
+  AGENT_CONNECTED,
+  AGENT_DISCONNECTED
+};
+State state = State::WAITING_AGENT;
+
 volatile bool e_stop = false;
 volatile int  auto_enable_debounce_ticks = 0;
 
@@ -157,6 +185,8 @@ void write_all_motors_from_cmds() {
 }
 
 void setup_depth_sensor() {
+  Wire.begin();
+
   Wire.setSDA(DEPTH_SENSOR_SDA_PIN);
   Wire.setSCL(DEPTH_SENSOR_SCL_PIN);
   depth_sensor_healthy = depth_sensor.init();
@@ -208,7 +238,7 @@ void cb_timer_fast(rcl_timer_t * /*timer*/, int64_t /*last_call_time*/) {
   msg_auto.data = auto_enable_publish;
   RCSOFTCHECK(rcl_publish(&pub_autonomy_switch, &msg_auto, nullptr));
 
-  // ---- DEPTH ----
+  // ---- Depth Sensor----
   float out_depth_m = -1.0f;
 
   if (!depth_sensor_healthy) {
@@ -252,6 +282,155 @@ void cb_timer_debug(rcl_timer_t * timer, int64_t last_call_time) {
   RCSOFTCHECK(rcl_publish(&pub_thrustout, &msg_thrust_out, nullptr));
 }
 
+// ------- microROS Entities ------
+static bool ros_create_entities() {
+  // --- allocator and support ---
+  allocator = rcl_get_default_allocator();
+
+  rcl_init_options_t init_options = rcl_get_zero_initialized_init_options();
+  if (rcl_init_options_init(&init_options, allocator) != RCL_RET_OK) return false;
+  if (rcl_init_options_set_domain_id(&init_options, ROS_DOMAIN_ID) != RCL_RET_OK) return false;
+  if (rclc_support_init_with_options(&support, 0, nullptr, &init_options, &allocator) != RCL_RET_OK) return false;
+
+  if (rclc_node_init_default(&node, "micro_ros_arduino_node", "", &support) != RCL_RET_OK) return false;
+
+  // --- subscribers ---
+  if (rclc_subscription_init_default(
+        &sub_thrust, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
+        "/thrust_cmds") != RCL_RET_OK) return false;
+
+  if (rclc_subscription_init_default(
+        &sub_estop, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool),
+        "/estop") != RCL_RET_OK) return false;
+
+  // --- publishers ---
+  if (rclc_publisher_init_default(
+        &pub_depth, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+        "/depth_sensor") != RCL_RET_OK) return false;
+
+  if (rclc_publisher_init_default(
+        &pub_autonomy_switch, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool),
+        "/auto_enable") != RCL_RET_OK) return false;
+
+  if (rclc_publisher_init_default(
+        &pub_thrustout, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
+        "/thrust_out") != RCL_RET_OK) return false;
+
+  // --- preallocate inbound /thrust_cmds ---
+  static float thrust_in_buf[NUM_THRUSTERS];
+  sub_thrust_msg.data.data     = thrust_in_buf;
+  sub_thrust_msg.data.size     = 0;
+  sub_thrust_msg.data.capacity = NUM_THRUSTERS;
+
+  sub_thrust_msg.layout.dim.capacity = 1;
+  sub_thrust_msg.layout.dim.size     = 0;
+  sub_thrust_msg.layout.dim.data     =
+    static_cast<std_msgs__msg__MultiArrayDimension*>(
+      malloc(sizeof(std_msgs__msg__MultiArrayDimension)));
+  sub_thrust_msg.layout.data_offset  = 0;
+
+  sub_thrust_msg.layout.dim.data[0].label.capacity = 0;
+  sub_thrust_msg.layout.dim.data[0].label.size     = 0;
+  sub_thrust_msg.layout.dim.data[0].label.data     = nullptr;
+
+  // --- preallocate outbound /thrust_out ---
+  static float thrust_out_buf[NUM_THRUSTERS] = {0.0f};
+  msg_thrust_out.data.data     = thrust_out_buf;
+  msg_thrust_out.data.size     = NUM_THRUSTERS;
+  msg_thrust_out.data.capacity = NUM_THRUSTERS;
+
+  msg_thrust_out.layout.dim.capacity = 1;
+  msg_thrust_out.layout.dim.size     = 0;
+  msg_thrust_out.layout.dim.data     =
+    static_cast<std_msgs__msg__MultiArrayDimension*>(
+      malloc(sizeof(std_msgs__msg__MultiArrayDimension)));
+  msg_thrust_out.layout.data_offset  = 0;
+
+  msg_thrust_out.layout.dim.data[0].label.capacity = 0;
+  msg_thrust_out.layout.dim.data[0].label.size     = 0;
+  msg_thrust_out.layout.dim.data[0].label.data     = nullptr;
+
+  // --- timers ---
+  if (rclc_timer_init_default(&timer_fast,  &support, RCL_MS_TO_NS(FAST_TIMER_PERIOD_ms),  cb_timer_fast ) != RCL_RET_OK) return false;
+  if (rclc_timer_init_default(&timer_debug, &support, RCL_MS_TO_NS(SLOW_TIMER_PERIOD_ms),  cb_timer_debug) != RCL_RET_OK) return false;
+
+  // --- executor ---
+  if (rclc_executor_init(&executor, &support.context, 4, &allocator) != RCL_RET_OK) return false;
+  if (rclc_executor_add_subscription(&executor, &sub_thrust, &sub_thrust_msg, cb_thrust, ON_NEW_DATA) != RCL_RET_OK) return false;
+  if (rclc_executor_add_subscription(&executor, &sub_estop,  &sub_estop_msg,  cb_estop,  ON_NEW_DATA)  != RCL_RET_OK) return false;
+  if (rclc_executor_add_timer(&executor, &timer_fast)  != RCL_RET_OK) return false;
+  if (rclc_executor_add_timer(&executor, &timer_debug) != RCL_RET_OK) return false;
+
+  return true;
+}
+
+static void ros_destroy_entities() {
+  // be resilient to partial init
+  (void) rcl_subscription_fini(&sub_thrust, &node);
+  (void) rcl_subscription_fini(&sub_estop,  &node);
+  (void) rcl_publisher_fini(&pub_depth, &node);
+  (void) rcl_publisher_fini(&pub_autonomy_switch, &node);
+  (void) rcl_publisher_fini(&pub_thrustout, &node);
+  (void) rcl_timer_fini(&timer_fast);
+  (void) rcl_timer_fini(&timer_debug);
+  (void) rclc_executor_fini(&executor);
+  (void) rcl_node_fini(&node);
+  (void) rclc_support_fini(&support);
+}
+
+
+// ------ Reconnect State Machine ------
+static void ros_tick() {
+  switch (state) {
+    case State::WAITING_AGENT:
+      write_all_motors_neutral();
+
+      if (every_n_ms(AGENT_PING_PERIOD_MS_WAITING)) {
+        const bool agent_up =
+          (RMW_RET_OK == rmw_uros_ping_agent(AGENT_PING_TIMEOUT_MS_WAITING, AGENT_PING_ATTEMPTS_WAITING));
+        state = agent_up ? State::AGENT_AVAILABLE : State::WAITING_AGENT;
+      }
+      break;
+
+    case State::AGENT_AVAILABLE: {
+      write_all_motors_neutral();
+
+      const bool created = ros_create_entities();
+      state = created ? State::AGENT_CONNECTED : State::WAITING_AGENT;
+
+      if (!created) {
+        ros_destroy_entities();  // clean any partial creation
+      }
+      break;
+    }
+
+    case State::AGENT_CONNECTED:
+      // Periodically verify link; if lost, drop entities and go wait
+      if (every_n_ms(AGENT_PING_PERIOD_MS_CONNECTED)) {
+        const bool still_up =
+          (RMW_RET_OK == rmw_uros_ping_agent(AGENT_PING_TIMEOUT_MS_CONNECTED, AGENT_PING_ATTEMPTS_CONNECTED));
+        if (!still_up) {
+          state = State::AGENT_DISCONNECTED;
+        }
+      }
+      // Run executor work budget while connected
+      (void) rclc_executor_spin_some(&executor, EXECUTOR_SPIN_BUDGET_ns);
+      break;
+
+    case State::AGENT_DISCONNECTED:
+      write_all_motors_neutral();
+      ros_destroy_entities();
+      state = State::WAITING_AGENT;
+      break;
+  }
+}
+
+
 
 // ------ Setup ------
 void setup() {
@@ -262,7 +441,6 @@ void setup() {
   Serial.begin(SERIAL_BAUDRATE);
   set_microros_serial_transports(Serial);
 
-
   // Genric I/O
   pinMode(STATUS_LED_PIN, OUTPUT);
   digitalWrite(STATUS_LED_PIN, HIGH);
@@ -271,83 +449,14 @@ void setup() {
 
   // Motors
   attach_motors_and_arm();
-
   setup_depth_sensor();
 
-  // microROS allocator 
-  allocator = rcl_get_default_allocator();
-
-  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
-
-  // Node
-  RCCHECK(rclc_node_init_default(&node, "frontseat_teensy41", "", &support));
-
-
-  // --- Subscribers ---
-  RCCHECK(rclc_subscription_init_default(
-    &sub_thrust,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
-    "/thrust_cmds"));
-
-  RCCHECK(rclc_subscription_init_default(
-    &sub_estop,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool),
-    "/estop"));
-
-  // --- Publishers ---
-  RCCHECK(rclc_publisher_init_default(
-    &pub_depth,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
-    "/depth_sensor"));
-
-  RCCHECK(rclc_publisher_init_default(
-    &pub_autonomy_switch,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool),
-    "/auto_enable"));
-
-  RCCHECK(rclc_publisher_init_default(
-    &pub_thrustout,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
-    "/thrust_out"));
-
-
-  static float thrust_out_buf[NUM_THRUSTERS] = {0.0f};
-  msg_thrust_out.data.data = thrust_out_buf;
-  msg_thrust_out.data.size = NUM_THRUSTERS;
-  msg_thrust_out.data.capacity = NUM_THRUSTERS;
-
-  // --- Timers ---
-  RCCHECK(rclc_timer_init_default(
-    &timer_fast,
-    &support,
-    RCL_MS_TO_NS(FAST_TIMER_PERIOD_ms),
-    cb_timer_fast));
-
-  RCCHECK(rclc_timer_init_default(
-    &timer_debug,
-    &support,
-    RCL_MS_TO_NS(SLOW_TIMER_PERIOD_ms),
-    cb_timer_debug));
-
-  // --- Executor ---
-  // 2 subscriptions + 2 timers = 4 handles
-  RCCHECK(rclc_executor_init(&executor, &support.context, 4, &allocator));
-
-  RCCHECK(rclc_executor_add_subscription(&executor, &sub_thrust, &sub_thrust_msg, cb_thrust,  ON_NEW_DATA));
-  RCCHECK(rclc_executor_add_subscription(&executor, &sub_estop,  &sub_estop_msg,  cb_estop,   ON_NEW_DATA));
-  RCCHECK(rclc_executor_add_timer(&executor, &timer_fast));
-  RCCHECK(rclc_executor_add_timer(&executor, &timer_debug));
+  state = State::WAITING_AGENT;
 }
 
 
 void loop() {
-  // Run executor work
-  RCCHECK(rclc_executor_spin_some(&executor, EXECUTOR_SPIN_BUDGET_ns));
+  ros_tick();
 
   if (depth_sensor_healthy) {
     depth_sensor.read();
@@ -362,7 +471,7 @@ void loop() {
   }
 
   // Drive ESCs from current thrust commands, honoring e-stop
-  if (e_stop) {
+  if (e_stop || state != State::AGENT_CONNECTED) {
     write_all_motors_neutral();
   } else {
     write_all_motors_from_cmds();

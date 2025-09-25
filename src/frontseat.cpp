@@ -185,11 +185,9 @@ void write_all_motors_from_cmds() {
 }
 
 void setup_depth_sensor() {
-  Wire.begin();
+  Wire2.begin();
 
-  Wire.setSDA(DEPTH_SENSOR_SDA_PIN);
-  Wire.setSCL(DEPTH_SENSOR_SCL_PIN);
-  depth_sensor_healthy = depth_sensor.init();
+  depth_sensor_healthy = depth_sensor.init(Wire2);
 
   if (depth_sensor_healthy) {
     depth_sensor.setModel(DEPTH_SENSOR_MODEL);
@@ -477,3 +475,4 @@ void loop() {
     write_all_motors_from_cmds();
   }
 }
+
